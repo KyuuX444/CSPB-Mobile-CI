@@ -600,9 +600,24 @@ jobs:
 
             echo "[decision] Target SDK: $target_sdk | Min SDK: $min_sdk | Compile SDK: $compile_sdk | Application ID: $app_id"
 
-            # 4. Determine jniLibs path
+            # 4. Determine jniLibs sourceSet path & inspect runtime library loading
             local jni_libs_dir="launcher-apk/app/src/main/jniLibs"
+            local custom_jnilibs=""
+            custom_jnilibs=$(grep -E 'jniLibs\.(srcDir|setSrcDirs)' launcher-apk/app/build.gradle* 2>/dev/null || true)
+            if [ -n "$custom_jnilibs" ]; then
+              echo "[decision] Detected custom jniLibs sourceSet hint: $(echo "$custom_jnilibs" | sed -n '1p')"
+            fi
             echo "[decision] jniLibs target path: $jni_libs_dir"
+
+            echo "Inspecting how launcher/engine loads client & server libraries..."
+            local load_evidence=""
+            load_evidence=$(grep -rnE "XASH3D_GAMELIBDIR|ANDROID_LoadLibrary|nativeLibraryDir" launcher-apk/app/src/main/ 2>/dev/null || true)
+            if [ -n "$load_evidence" ]; then
+              echo "$load_evidence" | sed -n '1,5p'
+              echo "[decision] Engine loads libclient.so & libserver.so via XASH3D_GAMELIBDIR / nativeLibraryDir (dlopen from extracted APK lib/<abi>/). Bundling into $jni_libs_dir + standalone ZIP."
+            else
+              echo "[decision] Standard Android nativeLibraryDir loading selected ($jni_libs_dir)."
+            fi
 
             # 5. Native library extraction & packaging trap
             echo "Checking android:extractNativeLibs and useLegacyPackaging..."

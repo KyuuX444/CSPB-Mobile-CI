@@ -25,7 +25,7 @@ This repository compiles the native game client & server libraries from [JangOet
 
 ## 🔐 Keystore & Signing Secrets Setup
 
-If secrets are not provided, the pipeline automatically generates a temporary throwaway self-signed keystore to ensure the APK is installable and testable. To use your own production release key:
+By default, this repository bundles a persistent release keystore (`keystore/cspb-release.jks`, alias `cspb`, password `android`) so automated builds and GitHub Releases work immediately out of the box with zero manual secret configuration. If repository secrets are provided (and the run is not a fork PR), they take priority over the bundled keystore; if neither exists, the pipeline generates a temporary throwaway keystore. To use your own private production release key:
 
 1. **Generate a keystore** (if you don't already have one):
    ```bash
