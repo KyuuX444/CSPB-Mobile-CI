@@ -675,7 +675,7 @@ jobs:
           fi
 
           # CI Gradle properties
-          printf 'org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8\norg.gradle.daemon=false\n' >> launcher-apk/gradle.properties
+          printf '\norg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8\norg.gradle.daemon=false\n' >> launcher-apk/gradle.properties
           echo "[decision] Appended CI JVM arguments to launcher-apk/gradle.properties"
           echo "::endgroup::"
 
@@ -712,7 +712,6 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           validate-wrappers: false
-          build-root-directory: launcher-apk
 
       - name: Build, Align, and Sign APK
         env:
