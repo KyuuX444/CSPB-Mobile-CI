@@ -614,14 +614,19 @@ jobs:
               fi
             fi
 
-            # Check packagingOptions / packaging jniLibs in build.gradle
-            if ! grep -q "useLegacyPackaging" launcher-apk/app/build.gradle*; then
-              echo "[decision] Injecting useLegacyPackaging = true into app/build.gradle"
-              if [ -f "launcher-apk/app/build.gradle.kts" ]; then
-                printf '\nandroid {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n}\n' >> launcher-apk/app/build.gradle.kts
-              elif [ -f "launcher-apk/app/build.gradle" ]; then
-                printf '\nandroid {\n    packagingOptions {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n}\n' >> launcher-apk/app/build.gradle
-              fi
+            # Disable vendored hlsdk-portable in CMake to prioritize CSPB native libraries and eliminate duplicate libclient.so/libserver.so
+            local cmake_file="launcher-apk/app/src/main/cpp/CMakeLists.txt"
+            if [ -f "$cmake_file" ]; then
+              echo "[decision] Disabling hlsdk-portable in $cmake_file so CMake does not build duplicate HL client/server libraries."
+              sed -i -E 's/(add_subdirectory\(["'\'']?hlsdk-portable["'\'']?\))/# [CI-FIX] \1 (Replaced by CSPB native libraries)/' "$cmake_file"
+            fi
+
+            # Configure packaging pickFirsts to prevent DuplicateRelativeFileException
+            echo "[decision] Configuring packaging pickFirsts for client and server libraries."
+            if [ -f "launcher-apk/app/build.gradle.kts" ]; then
+              printf '\nandroid {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n            pickFirsts.add("**/libclient.so")\n            pickFirsts.add("**/libserver.so")\n            pickFirsts.add("**/libc++_shared.so")\n        }\n    }\n}\n' >> launcher-apk/app/build.gradle.kts
+            elif [ -f "launcher-apk/app/build.gradle" ]; then
+              printf '\nandroid {\n    packagingOptions {\n        jniLibs {\n            useLegacyPackaging = true\n            pickFirst '\''**/libclient.so'\''\n            pickFirst '\''**/libserver.so'\''\n            pickFirst '\''**/libc++_shared.so'\''\n        }\n    }\n}\n' >> launcher-apk/app/build.gradle
             fi
 
             # 6. Check Gradle >= 7.3 and AGP >= 7.0 for JDK 17 compatibility
