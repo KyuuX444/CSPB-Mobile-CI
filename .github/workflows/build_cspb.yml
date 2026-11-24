@@ -1,0 +1,1009 @@
+name: Build CSPB Mobile
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build variant (Release or Debug)'
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NDK_VERSION: '21.4.7075529' # Default NDK r21e (r19c = 19.2.5345600)
+  ANDROID_PLATFORM: 'android-34'
+  BUILD_TOOLS: '34.0.0'
+  ABIS: 'armeabi-v7a arm64-v8a'
+  CSPB_REPO: 'JangOetama/CSPB-ANDROID-OPEN-SOURCE'
+  CSPB_REF: '' # Default branch HEAD if empty; pin to SHA/branch/tag when needed
+  LAUNCHER_REPO: 'FWGS/xash3d-android-project'
+  LAUNCHER_REF: '' # Default branch HEAD if empty; pin to SHA/branch/tag when needed
+
+jobs:
+  lint:
+    name: Lint Workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install and run actionlint
+        run: |
+          set -euo pipefail
+          echo "::group::Run actionlint"
+          bash <(curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint .github/workflows/build_cspb.yml
+          echo "actionlint passed successfully."
+          echo "::endgroup::"
+
+  native:
+    name: Compile Native Libs (${{ matrix.abi }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: armeabi-v7a
+            experimental: false
+          - abi: arm64-v8a
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - name: Checkout parent repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout CSPB core repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CSPB_REPO }}
+          ref: ${{ env.CSPB_REF }}
+          path: cspb-core
+          submodules: recursive
+          lfs: true
+          persist-credentials: false
+
+      - name: Environment report
+        run: |
+          set -euo pipefail
+          echo "::group::Environment Report"
+          echo "Runner OS: $(uname -a)"
+          if [ -f /etc/os-release ]; then
+            cat /etc/os-release
+          fi
+          echo "Disk Usage:"
+          df -h
+          echo "Target ABI: ${{ matrix.abi }}"
+          echo "Configured NDK Version: ${{ env.NDK_VERSION }}"
+          echo "Target Platform: ${{ env.ANDROID_PLATFORM }}"
+          echo "GCC Version: $(gcc --version 2>&1 | head -n 1 || echo 'gcc not found')"
+          echo "Clang Version: $(clang --version 2>&1 | head -n 1 || echo 'clang not found')"
+          echo "Make Version: $(make --version 2>&1 | head -n 1 || echo 'make not found')"
+          echo "Java Version: $(java -version 2>&1 | head -n 1 || echo 'java not found')"
+          echo "::endgroup::"
+
+      - name: Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}
+          key: ndk-${{ runner.os }}-${{ env.NDK_VERSION }}
+
+      - name: Install Android NDK
+        run: |
+          set -euo pipefail
+          echo "::group::Install Android NDK ${{ env.NDK_VERSION }}"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          NDK_PATH="$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}"
+
+          if [ -d "$NDK_PATH" ]; then
+            echo "[decision] NDK ${{ env.NDK_VERSION }} is present at $NDK_PATH."
+          else
+            echo "[decision] Installing NDK ${{ env.NDK_VERSION }} via sdkmanager."
+            yes | sdkmanager --licenses > /dev/null 2>&1 || true
+            sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+          fi
+
+          if [ ! -d "$NDK_PATH" ]; then
+            echo "ERROR: NDK directory was not found at $NDK_PATH" >&2
+            exit 1
+          fi
+
+          echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "$NDK_PATH" >> "$GITHUB_PATH"
+          echo "::endgroup::"
+
+      - name: Verify NDK Toolchain
+        run: |
+          set -euo pipefail
+          echo "::group::Verify ndk-build"
+          echo "[decision] Verifying ndk-build from $ANDROID_NDK_ROOT"
+          ndk-build --version
+          echo "::endgroup::"
+
+      - name: Discover Makefiles Layout
+        run: |
+          set -euo pipefail
+          discover_makefiles() {
+            echo "::group::Discover Makefiles Layout"
+            echo "=== cspb-core directory tree (depth 3) ==="
+            find cspb-core -maxdepth 3 -not -path '*/.*' | sort
+
+            echo "=== Locating Android.mk and Application.mk ==="
+            local android_mks=()
+            while IFS= read -r f; do
+              android_mks+=("$f")
+            done < <(find cspb-core -name "Android.mk" -not -path '*/.*' | sort)
+
+            local app_mks=()
+            while IFS= read -r f; do
+              app_mks+=("$f")
+            done < <(find cspb-core -name "Application.mk" -not -path '*/.*' | sort)
+
+            echo "Found Android.mk files:"
+            printf '  %s\n' "${android_mks[@]}"
+            echo "Found Application.mk files:"
+            printf '  %s\n' "${app_mks[@]}"
+
+            local selected_cspb_dir=""
+            local selected_build_script=""
+            local selected_app_mk=""
+
+            # Standard convention check: prefer jni/ directory containing both
+            if [ -f "cspb-core/jni/Android.mk" ] && [ -f "cspb-core/jni/Application.mk" ]; then
+              echo "[decision] Standard jni/ directory found with Android.mk and Application.mk."
+              selected_cspb_dir="cspb-core"
+              selected_build_script="jni/Android.mk"
+              selected_app_mk="jni/Application.mk"
+            elif [ -f "cspb-core/Android.mk" ] && [ -f "cspb-core/Application.mk" ]; then
+              echo "[decision] Root directory found with Android.mk and Application.mk."
+              selected_cspb_dir="cspb-core"
+              selected_build_script="Android.mk"
+              selected_app_mk="Application.mk"
+            else
+              local candidate_dirs=()
+              for mk in "${app_mks[@]}"; do
+                local d
+                d=$(dirname "$mk")
+                if [ -f "$d/Android.mk" ]; then
+                  candidate_dirs+=("$d")
+                fi
+              done
+
+              if [ ${#candidate_dirs[@]} -eq 0 ]; then
+                echo "ERROR: Could not find any directory containing both Android.mk and Application.mk!" >&2
+                exit 1
+              elif [ ${#candidate_dirs[@]} -eq 1 ]; then
+                local cand="${candidate_dirs[0]}"
+                echo "[decision] Single matching candidate directory found: $cand"
+                if [ "$(basename "$cand")" = "jni" ]; then
+                  selected_cspb_dir="$(dirname "$cand")"
+                  selected_build_script="jni/Android.mk"
+                  selected_app_mk="jni/Application.mk"
+                else
+                  selected_cspb_dir="$cand"
+                  selected_build_script="Android.mk"
+                  selected_app_mk="Application.mk"
+                fi
+              else
+                echo "ERROR: Multiple ambiguous directories contain both Android.mk and Application.mk:" >&2
+                printf '  %s\n' "${candidate_dirs[@]}" >&2
+                exit 1
+              fi
+            fi
+
+            echo "[decision] CSPB_DIR=$selected_cspb_dir"
+            echo "[decision] APP_BUILD_SCRIPT=$selected_build_script"
+            echo "[decision] APP_MK=$selected_app_mk"
+
+            if [ ! -f "$selected_cspb_dir/$selected_build_script" ]; then
+              echo "ERROR: APP_BUILD_SCRIPT '$selected_cspb_dir/$selected_build_script' does not exist!" >&2
+              exit 1
+            fi
+            if [ ! -f "$selected_cspb_dir/$selected_app_mk" ]; then
+              echo "ERROR: APP_MK '$selected_cspb_dir/$selected_app_mk' does not exist!" >&2
+              exit 1
+            fi
+
+            echo "CSPB_DIR=$selected_cspb_dir" >> "$GITHUB_ENV"
+            echo "APP_BUILD_SCRIPT=$selected_build_script" >> "$GITHUB_ENV"
+            echo "APP_MK=$selected_app_mk" >> "$GITHUB_ENV"
+            echo "::endgroup::"
+          }
+          discover_makefiles
+
+      - name: Apply Optional CSPB Patches
+        run: |
+          set -euo pipefail
+          echo "::group::Apply Optional CSPB Patches"
+          local_patch_dir="$GITHUB_WORKSPACE/.github/patches/cspb"
+          if [ -d "$local_patch_dir" ] && compgen -G "$local_patch_dir/*.patch" > /dev/null; then
+            echo "[decision] Found patches in $local_patch_dir"
+            for p in "$local_patch_dir"/*.patch; do
+              echo "[decision] Checking patch: $(basename "$p")"
+              git -C "$CSPB_DIR" apply --check "$p"
+              echo "[decision] Applying patch: $(basename "$p")"
+              git -C "$CSPB_DIR" apply "$p"
+            done
+          else
+            echo "[decision] No patches found in $local_patch_dir (skipping)."
+          fi
+          echo "::endgroup::"
+
+      - name: Sanitize Toolchain & Compile Native Libs
+        run: |
+          set -euo pipefail
+          sanitize_and_build() {
+            echo "::group::Sanitize Application.mk and Compile"
+            local app_mk_path="$CSPB_DIR/$APP_MK"
+
+            # Pitfall 1: NDK_TOOLCHAIN_VERSION=4.9 (GCC removed in modern NDKs)
+            if grep -q "NDK_TOOLCHAIN_VERSION" "$app_mk_path"; then
+              echo "[decision] Deprecated NDK_TOOLCHAIN_VERSION detected. Removing for Clang toolchain."
+              sed -i -E 's/(^[^#]*NDK_TOOLCHAIN_VERSION.*)/# [CI-FIX] \1 (Clang used by default)/' "$app_mk_path"
+              echo "- Fixed \`NDK_TOOLCHAIN_VERSION\` in \`Application.mk\` (GCC 4.9 is obsolete; using default Clang)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            # Pitfall 2: APP_PLATFORM compatibility for 64-bit ABIs
+            if [ "${{ matrix.abi }}" = "arm64-v8a" ]; then
+              local current_plat
+              current_plat=$(grep -E '^[[:space:]]*APP_PLATFORM[[:space:]]*:=' "$app_mk_path" | awk '{print $NF}' || true)
+              if [[ "$current_plat" =~ android-([0-9]+) ]]; then
+                local api_num="${BASH_REMATCH[1]}"
+                if [ "$api_num" -lt 21 ]; then
+                  echo "[decision] arm64-v8a requires at least android-21 (found $current_plat). Bumping to android-21."
+                  sed -i -E 's/APP_PLATFORM[[:space:]]*:=[[:space:]]*android-[0-9]+/APP_PLATFORM := android-21/' "$app_mk_path"
+                  echo "- Bumped \`APP_PLATFORM\` to \`android-21\` for \`arm64-v8a\` compatibility" >> "$GITHUB_STEP_SUMMARY"
+                fi
+              fi
+            fi
+
+            # Pitfall 3: Missing APP_STL
+            if ! grep -q "^[[:space:]]*APP_STL" "$app_mk_path"; then
+              echo "[decision] Missing APP_STL in $APP_MK. Setting APP_STL := c++_static"
+              echo "APP_STL := c++_static" >> "$app_mk_path"
+              echo "- Injected \`APP_STL := c++_static\` into \`Application.mk\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            # Pitfall 4: Obsolete STL (gnustl / stlport)
+            if grep -Eq 'APP_STL[[:space:]]*:=[[:space:]]*(gnustl|stlport)' "$app_mk_path"; then
+              echo "[decision] Deprecated STL detected in $APP_MK. Replacing with c++_static."
+              sed -i -E 's/APP_STL[[:space:]]*:=[[:space:]]*(gnustl|stlport)[^ ]*/APP_STL := c++_static/' "$app_mk_path"
+              echo "- Upgraded deprecated STL to \`c++_static\` in \`Application.mk\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            # Pitfall 5: Strip -m32 flags if present in makefiles
+            find "$CSPB_DIR" -name "*.mk" -exec sed -i 's/-m32//g' {} +
+
+            echo "=== Application.mk after sanitization ==="
+            cat "$app_mk_path"
+
+            echo "[decision] Invoking ndk-build for ABI ${{ matrix.abi }}..."
+            ndk-build -C "$CSPB_DIR" \
+              NDK_PROJECT_PATH=. \
+              APP_BUILD_SCRIPT="$APP_BUILD_SCRIPT" \
+              NDK_APPLICATION_MK="$APP_MK" \
+              APP_ABI="${{ matrix.abi }}" \
+              -j"$(nproc)" 2>&1 | tee "ndk-build-${{ matrix.abi }}.log"
+            echo "::endgroup::"
+          }
+          sanitize_and_build
+
+      - name: Locate and Verify Shared Libraries
+        run: |
+          set -euo pipefail
+          locate_and_verify() {
+            echo "::group::Locate and Verify Shared Libraries"
+            local abi="${{ matrix.abi }}"
+            local search_dir="$CSPB_DIR/libs/$abi"
+            if [ ! -d "$search_dir" ]; then
+              search_dir="$CSPB_DIR"
+            fi
+
+            echo "Searching for built shared libraries in $search_dir..."
+            local client_lib
+            client_lib=$(find "$search_dir" -name "*client*.so" | head -n 1 || true)
+            local server_lib
+            server_lib=$(find "$search_dir" -name "*server*.so" | head -n 1 || true)
+
+            if [ -z "$client_lib" ] || [ ! -f "$client_lib" ]; then
+              echo "ERROR: libclient.so (or *client*.so) was not generated for ABI $abi!" >&2
+              exit 1
+            fi
+            if [ -z "$server_lib" ] || [ ! -f "$server_lib" ]; then
+              echo "ERROR: libserver.so (or *server*.so) was not generated for ABI $abi!" >&2
+              exit 1
+            fi
+
+            echo "[decision] Found client library: $client_lib ($(basename "$client_lib"))"
+            echo "[decision] Found server library: $server_lib ($(basename "$server_lib"))"
+
+            mkdir -p "verified-libs/$abi"
+            cp "$client_lib" "verified-libs/$abi/libclient.so"
+            cp "$server_lib" "verified-libs/$abi/libserver.so"
+
+            local expected_arch=""
+            if [ "$abi" = "armeabi-v7a" ]; then
+              expected_arch="ARM"
+            elif [ "$abi" = "arm64-v8a" ]; then
+              expected_arch="AArch64"
+            else
+              echo "ERROR: Unknown ABI: $abi" >&2
+              exit 1
+            fi
+
+            local system_lib_regex="^(libc\.so|libm\.so|libdl\.so|liblog\.so|libz\.so|libOpenSLES\.so|libGLESv1_CM\.so|libGLESv2\.so|libGLESv3\.so|libandroid\.so|ld-android\.so|libc\+\+_shared\.so|libclient\.so|libserver\.so)$"
+
+            for lib in "verified-libs/$abi/libclient.so" "verified-libs/$abi/libserver.so"; do
+              local lib_name
+              lib_name=$(basename "$lib")
+              echo "Inspecting $lib_name ($abi)..."
+
+              if [ ! -s "$lib" ]; then
+                echo "ERROR: $lib_name is 0 bytes!" >&2
+                exit 1
+              fi
+
+              local header_machine
+              header_machine=$(readelf -h "$lib" | grep "Machine:" || true)
+              echo "  Header: $header_machine"
+              if ! echo "$header_machine" | grep -q "$expected_arch"; then
+                echo "ERROR: Architecture mismatch in $lib_name! Expected: $expected_arch, Header: $header_machine" >&2
+                exit 1
+              fi
+
+              echo "  Dependencies (NEEDED):"
+              readelf -d "$lib" | grep NEEDED || true
+
+              local needed_entries
+              needed_entries=$(readelf -d "$lib" | awk -F'[' '/NEEDED/ {sub(/\].*/, "", $2); print $2}')
+              for dep in $needed_entries; do
+                if echo "$dep" | grep -Eq "$system_lib_regex"; then
+                  echo "    - $dep: ALLOWED (system or shipped library)"
+                else
+                  echo "WARNING: $lib_name links against '$dep' which may not exist on stock Android devices!" >&2
+                fi
+
+                if [ "$dep" = "libc++_shared.so" ]; then
+                  if [ ! -f "verified-libs/$abi/libc++_shared.so" ]; then
+                    echo "[decision] $lib_name requires libc++_shared.so. Locating in NDK..."
+                    local sys_libcxx
+                    sys_libcxx=$(find "$ANDROID_NDK_ROOT" -name "libc++_shared.so" | grep "/$abi/" | head -n 1 || true)
+                    if [ -n "$sys_libcxx" ] && [ -f "$sys_libcxx" ]; then
+                      echo "[decision] Copying libc++_shared.so from $sys_libcxx"
+                      cp "$sys_libcxx" "verified-libs/$abi/libc++_shared.so"
+                    else
+                      echo "ERROR: libc++_shared.so required by $lib_name but missing in NDK sysroot!" >&2
+                      exit 1
+                    fi
+                  fi
+                fi
+              done
+            done
+
+            cp "ndk-build-$abi.log" "verified-libs/$abi/"
+            echo "::endgroup::"
+          }
+          locate_and_verify
+
+      - name: Upload Native Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.abi }}
+          path: verified-libs/${{ matrix.abi }}/
+          if-no-files-found: error
+
+      - name: Upload Native Build Log on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.abi }}-build-log
+          path: ndk-build-${{ matrix.abi }}.log
+          if-no-files-found: warn
+
+  apk:
+    name: Build & Package Launcher APK
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout parent repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout Xash3D launcher repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LAUNCHER_REPO }}
+          ref: ${{ env.LAUNCHER_REF }}
+          path: launcher-apk
+          submodules: recursive
+          lfs: true
+          persist-credentials: false
+
+      - name: Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK and Launcher NDK
+        run: |
+          set -euo pipefail
+          echo "::group::Setup Android SDK & NDK for Launcher"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+          # Check if launcher gradle pins a specific ndkVersion
+          local_launcher_ndk=""
+          if grep -Eq 'ndkVersion[[:space:]]*=' launcher-apk/app/build.gradle*; then
+            local_launcher_ndk=$(grep -E 'ndkVersion[[:space:]]*=' launcher-apk/app/build.gradle* | head -n 1 | sed -E 's/.*ndkVersion[[:space:]]*=[[:space:]]*["'\'']([^"'\'']+)["'\''].*/\1/')
+          fi
+
+          if [ -n "$local_launcher_ndk" ]; then
+            echo "[decision] Launcher pins ndkVersion '$local_launcher_ndk'."
+            if [ -d "$ANDROID_SDK_ROOT/ndk/$local_launcher_ndk" ]; then
+              echo "[decision] Pinned NDK $local_launcher_ndk is already installed."
+            else
+              echo "[decision] Installing pinned NDK $local_launcher_ndk via sdkmanager..."
+              if ! sdkmanager --install "ndk;$local_launcher_ndk"; then
+                echo "[decision] Pinned NDK $local_launcher_ndk unavailable. Falling back to default NDK ${{ env.NDK_VERSION }} and patching gradle pin."
+                sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+                sed -i -E "s/ndkVersion[[:space:]]*=[[:space:]]*[\"'][^\"']+[\"']/ndkVersion = \"${{ env.NDK_VERSION }}\"/" launcher-apk/app/build.gradle*
+                local_launcher_ndk="${{ env.NDK_VERSION }}"
+              fi
+            fi
+          else
+            echo "[decision] Launcher does not pin ndkVersion. Installing default NDK ${{ env.NDK_VERSION }}."
+            if [ ! -d "$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" ]; then
+              sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+            fi
+            local_launcher_ndk="${{ env.NDK_VERSION }}"
+          fi
+
+          echo "Installing SDK platform ${{ env.ANDROID_PLATFORM }} and build-tools ${{ env.BUILD_TOOLS }}..."
+          sdkmanager "platforms;${{ env.ANDROID_PLATFORM }}" "build-tools;${{ env.BUILD_TOOLS }}" "platform-tools"
+
+          echo "$ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}" >> "$GITHUB_PATH"
+          echo "LAUNCHER_NDK_DETECTED=$local_launcher_ndk" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+
+      - name: Download Native Libraries
+        uses: actions/download-artifact@v4
+        with:
+          path: native-libs
+          pattern: native-*
+          merge-multiple: false
+
+      - name: Inspect and Validate Available Native ABIs
+        run: |
+          set -euo pipefail
+          echo "::group::Inspect Downloaded Native Artifacts"
+          ls -laR native-libs
+
+          # Assert armeabi-v7a exists
+          v7a_client=$(find native-libs -path "*native-armeabi-v7a*/*libclient.so" -o -name "libclient.so" | grep "armeabi-v7a" | head -n 1 || true)
+          if [ -z "$v7a_client" ] || [ ! -f "$v7a_client" ]; then
+            echo "ERROR: Mandatory ABI armeabi-v7a native libraries are missing!" >&2
+            exit 1
+          fi
+          echo "[decision] Mandatory ABI armeabi-v7a found at: $v7a_client"
+
+          available_abis=()
+          for abi in armeabi-v7a arm64-v8a; do
+            if find native-libs -name "libclient.so" | grep -q "$abi"; then
+              available_abis+=("$abi")
+              echo "[decision] ABI '$abi' verified and available for packaging."
+            else
+              echo "[decision] ABI '$abi' not present in artifacts (skipped or non-fatal failure)."
+            fi
+          done
+
+          echo "AVAILABLE_ABIS=${available_abis[*]}" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+
+      - name: Discover Project Configuration & Adapt Compatibility
+        run: |
+          set -euo pipefail
+          discover_launcher() {
+            echo "::group::Discover Launcher Project Configuration"
+
+            # 1. Gradle wrapper version
+            local wrapper_file="launcher-apk/gradle/wrapper/gradle-wrapper.properties"
+            local gradle_ver="unknown"
+            if [ -f "$wrapper_file" ]; then
+              local dist_url
+              dist_url=$(grep "distributionUrl" "$wrapper_file" || true)
+              echo "Wrapper distribution URL: $dist_url"
+              if [[ "$dist_url" =~ gradle-([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+                gradle_ver="${BASH_REMATCH[1]}"
+              fi
+            fi
+            echo "[decision] Detected Gradle Version: $gradle_ver"
+
+            # 2. AGP version
+            local agp_ver="unknown"
+            local agp_line
+            agp_line=$(grep -E 'com\.android\.tools\.build:gradle|id\(["'\'']com\.android\.application["'\'']\)[[:space:]]*version' launcher-apk/build.gradle* launcher-apk/settings.gradle* launcher-apk/gradle/*.toml 2>/dev/null | head -n 1 || true)
+            if [[ "$agp_line" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+              agp_ver="${BASH_REMATCH[1]}"
+            fi
+            echo "[decision] Detected AGP Version: $agp_ver"
+
+            # 3. Read compileSdk, targetSdk, minSdk, applicationId
+            local compile_sdk
+            compile_sdk=$(grep -E 'compileSdk[[:space:]]*=' launcher-apk/app/build.gradle* | head -n 1 | awk '{print $NF}' || echo "unknown")
+            local target_sdk
+            target_sdk=$(grep -E 'targetSdk[[:space:]]*=' launcher-apk/app/build.gradle* | head -n 1 | awk '{print $NF}' || echo "unknown")
+            local min_sdk
+            min_sdk=$(grep -E 'minSdk[[:space:]]*=' launcher-apk/app/build.gradle* | head -n 1 | awk '{print $NF}' || echo "unknown")
+            local app_id
+            app_id=$(grep -E 'applicationId[[:space:]]*=' launcher-apk/app/build.gradle* | head -n 1 | awk '{print $NF}' | tr -d '"' | tr -d "'" || echo "su.xash.engine")
+
+            echo "[decision] Target SDK: $target_sdk | Min SDK: $min_sdk | Compile SDK: $compile_sdk | Application ID: $app_id"
+
+            # 4. Determine jniLibs path
+            local jni_libs_dir="launcher-apk/app/src/main/jniLibs"
+            echo "[decision] jniLibs target path: $jni_libs_dir"
+
+            # 5. Native library extraction & packaging trap
+            echo "Checking android:extractNativeLibs and useLegacyPackaging..."
+            local manifest_file="launcher-apk/app/src/main/AndroidManifest.xml"
+            if [ -f "$manifest_file" ]; then
+              if ! grep -q "android:extractNativeLibs" "$manifest_file"; then
+                echo "[decision] Injecting android:extractNativeLibs=\"true\" into AndroidManifest.xml"
+                sed -i 's/<application/<application android:extractNativeLibs="true"/' "$manifest_file"
+              fi
+            fi
+
+            # Check packagingOptions / packaging jniLibs in build.gradle
+            if ! grep -q "useLegacyPackaging" launcher-apk/app/build.gradle*; then
+              echo "[decision] Injecting useLegacyPackaging = true into app/build.gradle"
+              if [ -f "launcher-apk/app/build.gradle.kts" ]; then
+                printf '\nandroid {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n}\n' >> launcher-apk/app/build.gradle.kts
+              elif [ -f "launcher-apk/app/build.gradle" ]; then
+                printf '\nandroid {\n    packagingOptions {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n}\n' >> launcher-apk/app/build.gradle
+              fi
+            fi
+
+            # 6. Check Gradle >= 7.3 and AGP >= 7.0 for JDK 17 compatibility
+            if [ "$gradle_ver" != "unknown" ]; then
+              local major_ver
+              major_ver=$(echo "$gradle_ver" | cut -d. -f1)
+              local minor_ver
+              minor_ver=$(echo "$gradle_ver" | cut -d. -f2)
+              if [ "$major_ver" -lt 7 ] || { [ "$major_ver" -eq 7 ] && [ "$minor_ver" -lt 3 ]; }; then
+                echo "[decision] Gradle $gradle_ver is incompatible with JDK 17. Upgrading wrapper to 7.6.4."
+                sed -i -E 's|distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-7.6.4-bin.zip|' "$wrapper_file"
+                echo "- Upgraded Gradle wrapper to 7.6.4 for JDK 17 compatibility" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+
+            # Print git diff for step summary if changes were made
+            local diff_output
+            diff_output=$(git -C launcher-apk diff || true)
+            if [ -n "$diff_output" ]; then
+              echo "=== Compatibility Patches Applied ==="
+              echo "$diff_output"
+            fi
+
+            echo "GRADLE_VERSION_DETECTED=$gradle_ver" >> "$GITHUB_ENV"
+            echo "AGP_VERSION_DETECTED=$agp_ver" >> "$GITHUB_ENV"
+            echo "TARGET_SDK_DETECTED=$target_sdk" >> "$GITHUB_ENV"
+            echo "MIN_SDK_DETECTED=$min_sdk" >> "$GITHUB_ENV"
+            echo "APP_ID_DETECTED=$app_id" >> "$GITHUB_ENV"
+            echo "JNI_LIBS_DIR=$jni_libs_dir" >> "$GITHUB_ENV"
+            echo "::endgroup::"
+          }
+          discover_launcher
+
+      - name: Apply Optional Launcher Patches & Configure CI Properties
+        run: |
+          set -euo pipefail
+          echo "::group::Apply Launcher Patches and CI Properties"
+          local_patch_dir="$GITHUB_WORKSPACE/.github/patches/launcher"
+          if [ -d "$local_patch_dir" ] && compgen -G "$local_patch_dir/*.patch" > /dev/null; then
+            echo "[decision] Found patches in $local_patch_dir"
+            for p in "$local_patch_dir"/*.patch; do
+              echo "[decision] Checking launcher patch: $(basename "$p")"
+              git -C launcher-apk apply --check "$p"
+              echo "[decision] Applying launcher patch: $(basename "$p")"
+              git -C launcher-apk apply "$p"
+            done
+          else
+            echo "[decision] No patches found in $local_patch_dir (skipping)."
+          fi
+
+          # CI Gradle properties
+          printf 'org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8\norg.gradle.daemon=false\n' >> launcher-apk/gradle.properties
+          echo "[decision] Appended CI JVM arguments to launcher-apk/gradle.properties"
+          echo "::endgroup::"
+
+      - name: Copy Native Libraries to jniLibs
+        run: |
+          set -euo pipefail
+          echo "::group::Copy Native Libraries into APK SourceSet"
+          for abi in $AVAILABLE_ABIS; do
+            target_dir="$JNI_LIBS_DIR/$abi"
+            mkdir -p "$target_dir"
+            echo "[decision] Staging libraries for ABI $abi into $target_dir..."
+
+            client_src=$(find native-libs -path "*native-$abi*/*libclient.so" -o -name "libclient.so" | grep "$abi" | head -n 1)
+            server_src=$(find native-libs -path "*native-$abi*/*libserver.so" -o -name "libserver.so" | grep "$abi" | head -n 1)
+
+            cp "$client_src" "$target_dir/libclient.so"
+            cp "$server_src" "$target_dir/libserver.so"
+
+            # Check if libc++_shared.so is present in artifacts
+            libcxx_src=$(find native-libs -path "*native-$abi*/*libc++_shared.so" -o -name "libc++_shared.so" | grep "$abi" | head -n 1 || true)
+            if [ -n "$libcxx_src" ] && [ -f "$libcxx_src" ]; then
+              echo "[decision] Bundling libc++_shared.so for ABI $abi"
+              cp "$libcxx_src" "$target_dir/libc++_shared.so"
+            fi
+
+            echo "Contents of $target_dir:"
+            ls -lh "$target_dir"
+          done
+
+          chmod +x launcher-apk/gradlew
+          echo "::endgroup::"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build, Align, and Sign APK
+        env:
+          INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          build_and_sign() {
+            echo "::group::Build and Sign Android APK"
+            local build_type="${INPUT_BUILD_TYPE:-Release}"
+            echo "[decision] Effective build type: $build_type"
+
+            local is_fork="false"
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+                is_fork="true"
+              fi
+            fi
+
+            local keystore_path="$RUNNER_TEMP/release.keystore"
+            local ks_pass=""
+            local key_alias=""
+            local key_pass=""
+            local signing_mode=""
+
+            if [ "$is_fork" = "false" ] && \
+               [ -n "$KEYSTORE_BASE64" ] && \
+               [ -n "$KEYSTORE_PASSWORD" ] && \
+               [ -n "$KEY_ALIAS" ] && \
+               [ -n "$KEY_PASSWORD" ]; then
+              echo "[decision] Using repository secrets keystore for signing."
+              echo "$KEYSTORE_BASE64" | base64 -d > "$keystore_path"
+              ks_pass="$KEYSTORE_PASSWORD"
+              key_alias="$KEY_ALIAS"
+              key_pass="$KEY_PASSWORD"
+              signing_mode="Repository Secret Keystore"
+            else
+              echo "[decision] Repository secrets not configured or pull request is from a fork. Generating temporary throwaway keystore."
+              ks_pass="temporary_cspb_pass"
+              key_alias="cspb_throwaway_key"
+              key_pass="temporary_cspb_pass"
+              keytool -genkeypair \
+                -v \
+                -keystore "$keystore_path" \
+                -alias "$key_alias" \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -storepass "$ks_pass" \
+                -keypass "$key_pass" \
+                -dname "CN=CSPB Mobile Android CI, OU=Build Automation, O=Open Source, C=ID"
+              signing_mode="Temporary Throwaway Keystore (Self-Signed)"
+            fi
+
+            echo "SIGNING_MODE=$signing_mode" >> "$GITHUB_ENV"
+            echo "BUILD_TYPE=$build_type" >> "$GITHUB_ENV"
+
+            if [ "$build_type" = "Release" ]; then
+              echo "Executing ./gradlew assembleRelease..."
+              (cd launcher-apk && ./gradlew assembleRelease --stacktrace --no-daemon)
+
+              local built_apk
+              built_apk=$(find launcher-apk/app/build/outputs/apk/release -name "*.apk" -type f | head -n 1 || true)
+              if [ -z "$built_apk" ] || [ ! -f "$built_apk" ]; then
+                echo "ERROR: assembleRelease failed to output an APK file!" >&2
+                exit 1
+              fi
+              echo "[decision] Located release APK: $built_apk"
+
+              local aligned_apk="$RUNNER_TEMP/app-aligned.apk"
+              local signed_apk="$RUNNER_TEMP/final-signed.apk"
+
+              echo "Executing 4-byte page alignment with zipalign..."
+              zipalign -f -p 4 "$built_apk" "$aligned_apk"
+
+              echo "Signing APK with apksigner (v1 + v2 + v3)..."
+              apksigner sign \
+                --ks "$keystore_path" \
+                --ks-pass "pass:$ks_pass" \
+                --ks-key-alias "$key_alias" \
+                --key-pass "pass:$key_pass" \
+                --v1-signing-enabled true \
+                --v2-signing-enabled true \
+                --v3-signing-enabled true \
+                --out "$signed_apk" \
+                "$aligned_apk"
+
+              echo "FINAL_APK_PATH=$signed_apk" >> "$GITHUB_ENV"
+            else
+              echo "Executing ./gradlew assembleDebug..."
+              (cd launcher-apk && ./gradlew assembleDebug --stacktrace --no-daemon)
+
+              local built_debug_apk
+              built_debug_apk=$(find launcher-apk/app/build/outputs/apk/debug -name "*.apk" -type f | head -n 1 || true)
+              if [ -z "$built_debug_apk" ] || [ ! -f "$built_debug_apk" ]; then
+                echo "ERROR: assembleDebug failed to output an APK file!" >&2
+                exit 1
+              fi
+              echo "[decision] Located debug APK: $built_debug_apk"
+
+              local signed_apk="$RUNNER_TEMP/final-signed.apk"
+              cp "$built_debug_apk" "$signed_apk"
+              echo "FINAL_APK_PATH=$signed_apk" >> "$GITHUB_ENV"
+            fi
+            echo "::endgroup::"
+          }
+          build_and_sign
+
+      - name: Execute Verification Gates
+        run: |
+          set -euo pipefail
+          verify_apk() {
+            echo "::group::Verification Gate 1: apksigner verify"
+            apksigner verify --verbose --print-certs "$FINAL_APK_PATH"
+            echo "[decision] apksigner signature verification PASSED."
+            echo "::endgroup::"
+
+            echo "::group::Verification Gate 2: aapt2 dump badging"
+            local badging
+            badging=$(aapt2 dump badging "$FINAL_APK_PATH")
+            echo "$badging" | grep -E "package:|sdkVersion:|targetSdkVersion:|native-code:" || true
+            echo "[decision] aapt2 badging verification PASSED."
+            echo "::endgroup::"
+
+            echo "::group::Verification Gate 3: unzip -l native library verification"
+            local apk_contents
+            apk_contents=$(unzip -l "$FINAL_APK_PATH")
+
+            for abi in $AVAILABLE_ABIS; do
+              echo "Verifying native libraries inside APK for ABI: $abi..."
+              if ! echo "$apk_contents" | grep -q "lib/$abi/libclient.so"; then
+                echo "ERROR: lib/$abi/libclient.so is missing from APK!" >&2
+                exit 1
+              fi
+              if ! echo "$apk_contents" | grep -q "lib/$abi/libserver.so"; then
+                echo "ERROR: lib/$abi/libserver.so is missing from APK!" >&2
+                exit 1
+              fi
+              echo "  - lib/$abi/libclient.so: PRESENT"
+              echo "  - lib/$abi/libserver.so: PRESENT"
+            done
+
+            echo "Engine native libraries check:"
+            echo "$apk_contents" | grep "lib/" || true
+            echo "[decision] Native library contents verification PASSED."
+            echo "::endgroup::"
+
+            echo "::group::Verification Gate 4: Size and zipalign check"
+            local apk_bytes
+            apk_bytes=$(stat -c%s "$FINAL_APK_PATH")
+            echo "Final APK size: $apk_bytes bytes"
+            # Sanity check minimum 2MB (2097152 bytes)
+            if [ "$apk_bytes" -lt 2097152 ]; then
+              echo "ERROR: APK size ($apk_bytes bytes) is below minimum threshold (2MB)!" >&2
+              exit 1
+            fi
+
+            echo "Verifying 4-byte page alignment with zipalign -c -p 4..."
+            zipalign -c -p 4 "$FINAL_APK_PATH"
+            echo "[decision] 4-byte zipalign verification PASSED."
+            echo "::endgroup::"
+          }
+          verify_apk
+
+      - name: Prepare Deliverables & Package Native ZIP
+        run: |
+          set -euo pipefail
+          prepare_deliverables() {
+            echo "::group::Prepare Deliverables and Native ZIP"
+            mkdir -p staging
+
+            local short_sha="${GITHUB_SHA:0:7}"
+            local versioned_apk="CSPB-Mobile-Launcher-${BUILD_TYPE}-${short_sha}.apk"
+            local plain_apk="CSPB-Mobile-Launcher.apk"
+
+            cp "$FINAL_APK_PATH" "staging/$versioned_apk"
+            cp "$FINAL_APK_PATH" "staging/$plain_apk"
+
+            echo "[decision] Staged APK as $versioned_apk and $plain_apk"
+
+            # Build CSPB-Native-Libs.zip
+            mkdir -p zip_staging
+            for abi in $AVAILABLE_ABIS; do
+              mkdir -p "zip_staging/$abi/cl_dlls" "zip_staging/$abi/dlls"
+
+              local client_src
+              client_src=$(find native-libs -path "*native-$abi*/*libclient.so" -o -name "libclient.so" | grep "$abi" | head -n 1)
+              local server_src
+              server_src=$(find native-libs -path "*native-$abi*/*libserver.so" -o -name "libserver.so" | grep "$abi" | head -n 1)
+
+              cp "$client_src" "zip_staging/$abi/cl_dlls/libclient.so"
+              cp "$server_src" "zip_staging/$abi/dlls/libserver.so"
+
+              local libcxx_src
+              libcxx_src=$(find native-libs -path "*native-$abi*/*libc++_shared.so" -o -name "libc++_shared.so" | grep "$abi" | head -n 1 || true)
+              if [ -n "$libcxx_src" ] && [ -f "$libcxx_src" ]; then
+                cp "$libcxx_src" "zip_staging/$abi/cl_dlls/libc++_shared.so"
+                cp "$libcxx_src" "zip_staging/$abi/dlls/libc++_shared.so"
+              fi
+            done
+
+            {
+              echo '// ===================================================================='
+              echo '// Sample autoexec.cfg for Xash3D FWGS / CSPB Android'
+              echo '// ===================================================================='
+              echo '// NOTE: This is a generic sample configuration for mobile Xash3D engine.'
+              echo '// Game assets (models, sounds, sprites, maps) must be placed in your'
+              echo '// device game directory (e.g., /sdcard/xash/cstrike or /sdcard/xash/cspb).'
+              echo '// ===================================================================='
+              echo ''
+              echo '// Performance & Rendering Defaults'
+              echo 'fps_max "60"'
+              echo 'r_decals "100"'
+              echo 'cl_weather "0"'
+              echo 'gl_vsync "1"'
+              echo ''
+              echo '// Audio Defaults'
+              echo 'volume "0.8"'
+              echo 'suitvolume "0.5"'
+              echo ''
+              echo '// Mobile Touch Control Generic Helpers'
+              echo 'touch_enable "1"'
+              echo ''
+              echo 'echo "CSPB sample autoexec.cfg loaded successfully."'
+            } > zip_staging/autoexec.cfg
+
+            (cd zip_staging && zip -r "../staging/CSPB-Native-Libs.zip" .)
+            echo "[decision] Built staging/CSPB-Native-Libs.zip"
+
+            # Checksums
+            (cd staging && sha256sum "$versioned_apk" "$plain_apk" "CSPB-Native-Libs.zip" > SHA256SUMS.txt)
+            echo "=== SHA256SUMS.txt ==="
+            cat staging/SHA256SUMS.txt
+            echo "::endgroup::"
+          }
+          prepare_deliverables
+
+      - name: Generate Build Summary
+        run: |
+          set -euo pipefail
+          echo "::group::Generate Step Summary"
+          short_sha="${GITHUB_SHA:0:7}"
+          apk_size=$(du -h "staging/CSPB-Mobile-Launcher.apk" | cut -f1)
+
+          {
+            echo "## CSPB Android CI/CD Build Summary"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "| :--- | :--- |"
+            echo "| **Build Type** | \`$BUILD_TYPE\` |"
+            echo "| **Commit SHA** | \`$short_sha\` (\`${GITHUB_SHA}\`) |"
+            echo "| **ABIs Bundled** | \`$AVAILABLE_ABIS\` |"
+            echo "| **NDK Version (Native Core)** | \`${{ env.NDK_VERSION }}\` |"
+            echo "| **NDK Version (Launcher)** | \`$LAUNCHER_NDK_DETECTED\` |"
+            echo "| **Gradle Version** | \`$GRADLE_VERSION_DETECTED\` |"
+            echo "| **AGP Version** | \`$AGP_VERSION_DETECTED\` |"
+            echo "| **APK File** | \`CSPB-Mobile-Launcher-${BUILD_TYPE}-${short_sha}.apk\` |"
+            echo "| **APK Size** | \`$apk_size\` |"
+            echo "| **Signing Mode** | \`$SIGNING_MODE\` |"
+            echo ""
+            echo "### Artifact SHA-256 Checksums"
+            echo ""
+            echo '```text'
+            cat staging/SHA256SUMS.txt
+            echo '```'
+            echo ""
+            echo "> **Note**: Game assets (cstrike/valve data, models, sounds, maps) are not bundled in the APK due to licensing and size, and must be copied to the device game folder manually."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cspb-mobile-artifacts
+          path: staging/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Failure Logs and Reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-failure-reports
+          path: |
+            launcher-apk/**/build/reports/
+            launcher-apk/**/*.log
+            *.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Cleanup Keystore and Secrets
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "[decision] Removing temporary keystore and intermediate signed binaries from runner temp."
+          rm -f "$RUNNER_TEMP/release.keystore" "$RUNNER_TEMP/app-aligned.apk" "$RUNNER_TEMP/final-signed.apk"
+
+  release:
+    name: Publish GitHub Release
+    needs: apk
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download Release Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cspb-mobile-artifacts
+          path: release-artifacts
+
+      - name: Publish Release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/CSPB-Mobile-Launcher-*.apk
+            release-artifacts/CSPB-Mobile-Launcher.apk
+            release-artifacts/CSPB-Native-Libs.zip
+            release-artifacts/SHA256SUMS.txt
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
