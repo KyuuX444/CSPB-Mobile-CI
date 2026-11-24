@@ -249,10 +249,10 @@ jobs:
             fi
 
             {
-              echo "CSPB_DIR="
-              echo "APP_BUILD_SCRIPT="
-              echo "APP_MK="
-            } >> ""
+              echo "CSPB_DIR=$selected_cspb_dir"
+              echo "APP_BUILD_SCRIPT=$selected_build_script"
+              echo "APP_MK=$selected_app_mk"
+            } >> "$GITHUB_ENV"
             echo "::endgroup::"
           }
           discover_makefiles
@@ -646,13 +646,13 @@ jobs:
             fi
 
             {
-              echo "GRADLE_VERSION_DETECTED="
-              echo "AGP_VERSION_DETECTED="
-              echo "TARGET_SDK_DETECTED="
-              echo "MIN_SDK_DETECTED="
-              echo "APP_ID_DETECTED="
-              echo "JNI_LIBS_DIR="
-            } >> ""
+              echo "GRADLE_VERSION_DETECTED=$gradle_ver"
+              echo "AGP_VERSION_DETECTED=$agp_ver"
+              echo "TARGET_SDK_DETECTED=$target_sdk"
+              echo "MIN_SDK_DETECTED=$min_sdk"
+              echo "APP_ID_DETECTED=$app_id"
+              echo "JNI_LIBS_DIR=$jni_libs_dir"
+            } >> "$GITHUB_ENV"
             echo "::endgroup::"
           }
           discover_launcher
