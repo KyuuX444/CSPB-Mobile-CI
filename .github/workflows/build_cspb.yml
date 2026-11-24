@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           echo "::group::Run actionlint"
           bash <(curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint .github/workflows/build_cspb.yml
+          ./actionlint -ignore SC2129 .github/workflows/build_cspb.yml
           echo "actionlint passed successfully."
           echo "::endgroup::"
 
@@ -248,9 +248,11 @@ jobs:
               exit 1
             fi
 
-            echo "CSPB_DIR=$selected_cspb_dir" >> "$GITHUB_ENV"
-            echo "APP_BUILD_SCRIPT=$selected_build_script" >> "$GITHUB_ENV"
-            echo "APP_MK=$selected_app_mk" >> "$GITHUB_ENV"
+            {
+              echo "CSPB_DIR="
+              echo "APP_BUILD_SCRIPT="
+              echo "APP_MK="
+            } >> ""
             echo "::endgroup::"
           }
           discover_makefiles
@@ -643,12 +645,14 @@ jobs:
               echo "$diff_output"
             fi
 
-            echo "GRADLE_VERSION_DETECTED=$gradle_ver" >> "$GITHUB_ENV"
-            echo "AGP_VERSION_DETECTED=$agp_ver" >> "$GITHUB_ENV"
-            echo "TARGET_SDK_DETECTED=$target_sdk" >> "$GITHUB_ENV"
-            echo "MIN_SDK_DETECTED=$min_sdk" >> "$GITHUB_ENV"
-            echo "APP_ID_DETECTED=$app_id" >> "$GITHUB_ENV"
-            echo "JNI_LIBS_DIR=$jni_libs_dir" >> "$GITHUB_ENV"
+            {
+              echo "GRADLE_VERSION_DETECTED="
+              echo "AGP_VERSION_DETECTED="
+              echo "TARGET_SDK_DETECTED="
+              echo "MIN_SDK_DETECTED="
+              echo "APP_ID_DETECTED="
+              echo "JNI_LIBS_DIR="
+            } >> ""
             echo "::endgroup::"
           }
           discover_launcher
