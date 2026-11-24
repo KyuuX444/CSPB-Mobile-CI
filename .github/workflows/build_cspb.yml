@@ -125,6 +125,18 @@ jobs:
           set -euo pipefail
           echo "::group::Install Android NDK ${{ env.NDK_VERSION }}"
           export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          
+          # Ensure sdkmanager is in PATH
+          if ! command -v sdkmanager &> /dev/null; then
+            for bin_cand in "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" "$ANDROID_SDK_ROOT/cmdline-tools"/*/bin "$ANDROID_SDK_ROOT/tools/bin"; do
+              if [ -x "$bin_cand/sdkmanager" ]; then
+                export PATH="$bin_cand:$PATH"
+                echo "$bin_cand" >> "$GITHUB_PATH"
+                break
+              fi
+            done
+          fi
+
           NDK_PATH="$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}"
 
           if [ -d "$NDK_PATH" ]; then
@@ -464,6 +476,18 @@ jobs:
           set -euo pipefail
           echo "::group::Setup Android SDK & NDK for Launcher"
           export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+
+          # Ensure sdkmanager is in PATH
+          if ! command -v sdkmanager &> /dev/null; then
+            for bin_cand in "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" "$ANDROID_SDK_ROOT/cmdline-tools"/*/bin "$ANDROID_SDK_ROOT/tools/bin"; do
+              if [ -x "$bin_cand/sdkmanager" ]; then
+                export PATH="$bin_cand:$PATH"
+                echo "$bin_cand" >> "$GITHUB_PATH"
+                break
+              fi
+            done
+          fi
+
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
 
           # Check if launcher gradle pins a specific ndkVersion
@@ -721,8 +745,15 @@ jobs:
               key_alias="$KEY_ALIAS"
               key_pass="$KEY_PASSWORD"
               signing_mode="Repository Secret Keystore"
+            elif [ -f "$GITHUB_WORKSPACE/keystore/cspb-release.jks" ]; then
+              echo "[decision] Using bundled persistent release keystore (keystore/cspb-release.jks)."
+              cp "$GITHUB_WORKSPACE/keystore/cspb-release.jks" "$keystore_path"
+              ks_pass="${KEYSTORE_PASSWORD:-android}"
+              key_alias="${KEY_ALIAS:-cspb}"
+              key_pass="${KEY_PASSWORD:-android}"
+              signing_mode="Bundled Persistent Keystore (keystore/cspb-release.jks)"
             else
-              echo "[decision] Repository secrets not configured or pull request is from a fork. Generating temporary throwaway keystore."
+              echo "[decision] Repository secrets not configured and no bundled keystore. Generating temporary throwaway keystore."
               ks_pass="temporary_cspb_pass"
               key_alias="cspb_throwaway_key"
               key_pass="temporary_cspb_pass"
