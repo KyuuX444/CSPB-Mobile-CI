@@ -710,6 +710,9 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: false
+          build-root-directory: launcher-apk
 
       - name: Build, Align, and Sign APK
         env:
